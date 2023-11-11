@@ -52,52 +52,45 @@ export class PrivateChannelManager {
 	}
 
 	private async _handleVoiceStateUpdate(oldState: VoiceState, newState: VoiceState) {
-		const voiceState = oldState.channel?.id ? oldState : newState;
-		if (!voiceState.member || voiceState.member.user.bot) return;
+		const settings = this.client.database.get(newState.guild.id);
+		if (!settings) return;
 
-		const settings = this.client.database.get(voiceState.guild.id);
-		if (!settings?.pcts.length) return;
+		const stgs = structuredClone(settings);
 
-		if (isEqual(voiceState, newState)) {
-			const trigger = settings.pcts.find(c => c.id === voiceState.channel?.id);
-			if (!trigger) return;
+		if (newState.channel?.id && newState.channel.parent && newState.member && !newState.member.user.bot) {
+			const triggerChannelData = stgs.pcts.find(t => t.id === newState.channelId);
+			if (!triggerChannelData) return;
 
-			const triggerVoiceChannel = voiceState.guild.channels.cache.get(trigger.id) as VoiceChannel;
-			if (!triggerVoiceChannel) return;
-
-			const ownedChannel = await voiceState.guild.channels.create({
-				name: trigger.ownedChannelName ?? voiceState.member.displayName,
-				parent: triggerVoiceChannel.parent,
-				type: ChannelType.GuildVoice,
-				permissionOverwrites: [
-					{
-						allow: PermissionFlagsBits.ManageChannels,
-						id: voiceState.member.id
-					}
-				]
+			const ownedChannel = await newState.guild.channels.create({
+				permissionOverwrites: [{ id: newState.member.id, allow: PermissionFlagsBits.ManageChannels }],
+				name: triggerChannelData.ownedChannelName ?? newState.member.displayName,
+				parent: newState.channel.parentId,
+				type: ChannelType.GuildVoice
 			});
 
-			const ocd: IPrivateChannel[] = [{ id: ownedChannel.id, triggerChannelId: trigger.id }];
-			const triggerInSettings = settings.pcts[settings.pcts.indexOf(trigger)];
+			await newState.setChannel(ownedChannel);
 
-			triggerInSettings!.ownedChannels = unionWith(triggerInSettings?.ownedChannels, ocd, isEqual);
+			const ownedChannelData: IPrivateChannel = { id: ownedChannel.id, triggerChannelId: newState.channel.id };
+			const triggerInSettings = stgs.pcts[stgs.pcts.indexOf(triggerChannelData)];
+			triggerInSettings!.ownedChannels = unionWith(triggerInSettings!.ownedChannels, [ownedChannelData], isEqual);
+		}
 
-			this.client.database.set(voiceState.guild.id, settings);
-			await voiceState.setChannel(ownedChannel);
-		} else {
-			const category = voiceState.channel?.parent;
-			if (!category) return;
+		if (oldState.channel?.id) {
+			const triggerInCategory = stgs.pcts.find(t => t.ownedChannels?.some(c => c.id === oldState.channel?.id));
+			if (!triggerInCategory?.ownedChannels?.length) return;
 
-			const trigger = settings.pcts.find(t => category.children.cache.some(c => c.id === t.id));
-			if (!trigger) return;
+			for (const ownedChannelData of triggerInCategory.ownedChannels) {
+				const ownedChannel = oldState.guild.channels.cache.get(ownedChannelData.id) as VoiceChannel;
+				if (!ownedChannel) continue;
 
-			for (const channel of category.children.cache.values()) {
-				const ownedChannelData = trigger.ownedChannels?.find(c => c.id === channel.id);
-				if (!ownedChannelData) continue;
+				const isChannelEmpty = ownedChannel.members.filter(m => !m.user.bot).size === 0;
+				if (!isChannelEmpty || !ownedChannel.deletable) continue;
 
-				const isChannelEmpty = channel.members.filter(m => !m.user.bot).size === 0;
-				if (isChannelEmpty && channel.deletable) await channel.delete();
+				await ownedChannel.delete();
+				remove(triggerInCategory.ownedChannels, c => c.id === ownedChannel.id);
 			}
 		}
+
+		if (!isEqual(stgs, settings)) this.client.database.set(oldState.guild.id, stgs);
 	}
 }
